@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from typing import List, Tuple
-import openai
+from typing import List, Tuple, Union, Dict
+from openai import OpenAI
 
 def is_id_or_reference_column(col: str) -> bool:
     """
@@ -98,22 +98,21 @@ def is_numeric_column(df: pd.DataFrame, col: str) -> bool:
     Determine if a column contains numeric values, even if stored as strings.
     Handles currency and other formatted numbers.
     """
-    # If already numeric, return True
+    # If already numeric (including int64), return True
     if pd.api.types.is_numeric_dtype(df[col]):
         return True
     
-    # If not string, return False
-    if not pd.api.types.is_string_dtype(df[col]):
-        return False
+    # If string, try to convert to numeric
+    if pd.api.types.is_string_dtype(df[col]):
+        try:
+            # Remove currency symbols and commas, then try to convert
+            test_values = df[col].astype(str).str.replace('$', '').str.replace(',', '')
+            pd.to_numeric(test_values, errors='raise')
+            return True
+        except:
+            return False
     
-    # Try to convert to numeric, handling currency symbols and commas
-    try:
-        # Remove currency symbols and commas, then try to convert
-        test_values = df[col].astype(str).str.replace('$', '').str.replace(',', '')
-        pd.to_numeric(test_values, errors='raise')
-        return True
-    except:
-        return False
+    return False
 
 def analyze_dataframe(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
     """
@@ -124,146 +123,188 @@ def analyze_dataframe(df: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
     
     # Get all columns except ID/reference columns
     all_cols = [col for col in df.columns if not is_id_or_reference_column(col)]
+    st.write(f"Columns available for analysis: {all_cols}")
     
     # Get numeric and categorical columns
     numeric_cols = [col for col in all_cols if is_numeric_column(df, col)]
     categorical_cols = [col for col in all_cols if not is_numeric_column(df, col) and not pd.api.types.is_datetime64_any_dtype(df[col])]
     
+    st.write(f"Numeric columns found: {numeric_cols}")
+    st.write(f"Categorical columns found: {categorical_cols}")
+    
+    if not numeric_cols:
+        st.warning("No numeric columns found in the dataset. Please ensure your CSV contains numeric data.")
+        return suggestions
+    
+    if not categorical_cols:
+        st.warning("No categorical columns found in the dataset. Please ensure your CSV contains categorical data.")
+        return suggestions
+    
     # Convert string numeric columns to actual numeric values
     for col in numeric_cols:
         if pd.api.types.is_string_dtype(df[col]):
-            df[col] = df[col].astype(str).str.replace('$', '').str.replace(',', '').astype(float)
+            # Handle percentage values
+            if any(term in col.lower() for term in ['rate', 'percentage', '%', 'percent']):
+                df[col] = df[col].astype(str).str.replace('%', '').str.replace(',', '').astype(float) / 100
+            else:
+                df[col] = df[col].astype(str).str.replace('$', '').str.replace(',', '').astype(float)
     
     # Define common aggregation functions
     agg_funcs = ['mean', 'min', 'max', 'count']
     
-    # 1. Basic Statistics for each numeric column
-    for num_col in numeric_cols:
-        # Basic statistics
-        stats = df[num_col].describe()
-        description = f"Basic Statistics for {num_col}"
-        suggestions.append((description, pd.DataFrame(stats)))
+    # Define named functions for quartiles
+    def q1(x): return x.quantile(0.25)
+    def q3(x): return x.quantile(0.75)
+    
+    agg_funcs_with_quartiles = ['min', q1, 'median', q3, 'max', 'mean', 'std', 'count']
+    
+    def is_meaningful_pivot_table(pivot_table: pd.DataFrame) -> bool:
+        """
+        Check if a pivot table provides meaningful insights.
+        Returns False if all counts are 1 or if the table is empty.
+        """
+        if pivot_table.empty:
+            return False
+            
+        # If the table has a count column, check if all counts are 1
+        if isinstance(pivot_table.columns, pd.MultiIndex):
+            count_cols = [col for col in pivot_table.columns if 'count' in str(col).lower()]
+            if count_cols:
+                for count_col in count_cols:
+                    # Get the count values as a numpy array
+                    count_values = pivot_table[count_col].to_numpy()
+                    # Check if any value is greater than 1
+                    if not np.any(count_values > 1):
+                        return False
+        else:
+            if 'count' in pivot_table.columns:
+                # Get the count values as a numpy array
+                count_values = pivot_table['count'].to_numpy()
+                # Check if any value is greater than 1
+                if not np.any(count_values > 1):
+                    return False
         
-        # Distribution by categorical columns
+        return True
+    
+    def create_pivot_table(df: pd.DataFrame, values: str, index: Union[str, List[str]], aggfunc: Union[List[str], Dict[str, Union[str, callable]]]) -> pd.DataFrame:
+        """
+        Create a pivot table with proper handling of MultiIndex columns and duplicate column names.
+        """
+        try:
+            # Create the pivot table
+            pivot_table = pd.pivot_table(
+                df,
+                values=values,
+                index=index,
+                aggfunc=aggfunc,
+                fill_value=0  # Fill NaN values with 0
+            )
+            
+            # If the columns are MultiIndex, rename them to avoid duplicates
+            if isinstance(pivot_table.columns, pd.MultiIndex):
+                new_columns = []
+                for col in pivot_table.columns:
+                    if isinstance(col, tuple):
+                        # For MultiIndex columns, combine the levels with an underscore
+                        new_col = f"{col[0]}_{col[1]}"
+                    else:
+                        new_col = str(col)
+                    new_columns.append(new_col)
+                pivot_table.columns = new_columns
+            
+            # Rename columns to be more descriptive
+            column_mapping = {}
+            for col in pivot_table.columns:
+                # Handle both direct column names and names with underscores
+                base_name = col.split('_')[0] if '_' in col else col
+                if base_name == 'min':
+                    column_mapping[col] = f'Min {values}'
+                elif base_name == 'q1':
+                    column_mapping[col] = f'Q1 (25th) {values}'
+                elif base_name == 'median':
+                    column_mapping[col] = f'Median (50th) {values}'
+                elif base_name == 'q3':
+                    column_mapping[col] = f'Q3 (75th) {values}'
+                elif base_name == 'max':
+                    column_mapping[col] = f'Max {values}'
+                elif base_name == 'mean':
+                    column_mapping[col] = f'Mean {values}'
+                elif base_name == 'std':
+                    column_mapping[col] = f'Std Dev {values}'
+                elif base_name == 'count':
+                    column_mapping[col] = f'Count {values}'
+                else:
+                    column_mapping[col] = col
+            
+            # Apply the column mapping
+            pivot_table.columns = [column_mapping.get(col, col) for col in pivot_table.columns]
+            
+            return pivot_table
+            
+        except Exception as e:
+            st.warning(f"Could not create pivot table for {values} by {index}: {str(e)}")
+            return pd.DataFrame()
+    
+    # Create pivot tables for numeric metrics by categorical columns
+    for metric in numeric_cols:
+        # Single categorical column analysis
         for cat_col in categorical_cols:
-            if df[cat_col].nunique() <= 20:
-                # Average by category
-                avg_by_cat = pd.pivot_table(
-                    df,
-                    values=num_col,
-                    index=cat_col,
-                    aggfunc='mean'
-                )
-                description = f"Average {num_col} by {cat_col}"
-                suggestions.append((description, avg_by_cat))
+            # Skip if the categorical column is time-based
+            if any(term in cat_col.lower() for term in ['year', 'month', 'week', 'day', 'period', 'quarter', 'date']):
+                continue
+            try:
+                # Basic analysis
+                pivot_table = create_pivot_table(df, metric, cat_col, agg_funcs)
+                if is_meaningful_pivot_table(pivot_table):
+                    description = f"{metric} by {cat_col}"
+                    suggestions.append((description, pivot_table))
                 
-                # Distribution statistics by category
-                dist_by_cat = pd.pivot_table(
-                    df,
-                    values=num_col,
-                    index=cat_col,
-                    aggfunc=['mean', 'min', 'max', lambda x: x.quantile(0.25), lambda x: x.quantile(0.75)]
-                )
-                description = f"Distribution of {num_col} by {cat_col}"
-                suggestions.append((description, dist_by_cat))
-                
-                # Count by category
-                count_by_cat = pd.pivot_table(
-                    df,
-                    values=num_col,
-                    index=cat_col,
-                    aggfunc='count'
-                )
-                description = f"Count of {num_col} by {cat_col}"
-                suggestions.append((description, count_by_cat))
-    
-    # 2. Combined Analysis: Numeric by two categoricals
-    for num_col in numeric_cols:
-        for i, cat1 in enumerate(categorical_cols):
-            for cat2 in categorical_cols[i+1:]:
-                if df[cat1].nunique() <= 20 and df[cat2].nunique() <= 20:
-                    # Average by both categories
-                    avg_by_both = pd.pivot_table(
-                        df,
-                        values=num_col,
-                        index=[cat1, cat2],
-                        aggfunc='mean'
-                    )
-                    description = f"Average {num_col} by {cat1} and {cat2}"
-                    suggestions.append((description, avg_by_both))
+                # Only create quartile analysis if:
+                # 1. The categorical column has enough unique values (not too granular)
+                # 2. The metric is continuous (not discrete)
+                # 3. We have enough data points per category
+                if (df[cat_col].nunique() <= 20 and  # Not too many categories
+                    pd.api.types.is_float_dtype(df[metric]) and  # Continuous metric
+                    df.groupby(cat_col)[metric].count().min() >= 5):  # At least 5 data points per category
                     
-                    # Distribution by both categories
-                    dist_by_both = pd.pivot_table(
-                        df,
-                        values=num_col,
-                        index=[cat1, cat2],
-                        aggfunc=['mean', 'min', 'max']
-                    )
-                    description = f"Distribution of {num_col} by {cat1} and {cat2}"
-                    suggestions.append((description, dist_by_both))
-    
-    # 3. Categorical Relationships
-    for i, cat1 in enumerate(categorical_cols):
-        for cat2 in categorical_cols[i+1:]:
-            if df[cat1].nunique() <= 20 and df[cat2].nunique() <= 20:
-                # Count distribution
-                crosstab = pd.crosstab(df[cat1], df[cat2], margins=True)
-                description = f"Distribution of {cat1} by {cat2}"
-                suggestions.append((description, crosstab))
-                
-                # Percentage distribution (row-wise)
-                crosstab_pct_row = pd.crosstab(df[cat1], df[cat2], normalize='index') * 100
-                description = f"Percentage Distribution of {cat1} by {cat2} (Row-wise)"
-                suggestions.append((description, crosstab_pct_row))
-                
-                # Percentage distribution (column-wise)
-                crosstab_pct_col = pd.crosstab(df[cat1], df[cat2], normalize='columns') * 100
-                description = f"Percentage Distribution of {cat1} by {cat2} (Column-wise)"
-                suggestions.append((description, crosstab_pct_col))
-    
-    # 4. Time-based Analysis (if applicable)
-    date_cols = [col for col in all_cols if pd.api.types.is_datetime64_any_dtype(df[col])]
-    for date_col in date_cols:
-        # Extract year, month, and day
-        df['Year'] = df[date_col].dt.year
-        df['Month'] = df[date_col].dt.month
-        df['Day'] = df[date_col].dt.day
+                    pivot_table = create_pivot_table(df, metric, cat_col, agg_funcs_with_quartiles)
+                    if is_meaningful_pivot_table(pivot_table):
+                        description = f"Detailed {metric} Analysis by {cat_col} (with quartiles)"
+                        suggestions.append((description, pivot_table))
+            except Exception as e:
+                st.warning(f"Could not create pivot table for {metric} by {cat_col}: {str(e)}")
+                continue
         
-        # Analyze numeric columns by time dimensions
-        for num_col in numeric_cols:
-            # By year
-            yearly_stats = pd.pivot_table(
-                df,
-                values=num_col,
-                index='Year',
-                aggfunc=agg_funcs
-            )
-            description = f"Yearly Statistics of {num_col}"
-            suggestions.append((description, yearly_stats))
-            
-            # By month
-            monthly_stats = pd.pivot_table(
-                df,
-                values=num_col,
-                index='Month',
-                aggfunc=agg_funcs
-            )
-            description = f"Monthly Statistics of {num_col}"
-            suggestions.append((description, monthly_stats))
-            
-            # By year and month
-            yearly_monthly_stats = pd.pivot_table(
-                df,
-                values=num_col,
-                index=['Year', 'Month'],
-                aggfunc=agg_funcs
-            )
-            description = f"Yearly and Monthly Statistics of {num_col}"
-            suggestions.append((description, yearly_monthly_stats))
-    
-    # Clean up temporary columns
-    if 'Year' in df.columns:
-        df.drop(['Year', 'Month', 'Day'], axis=1, inplace=True)
+        # Two categorical columns analysis
+        for i, cat_col1 in enumerate(categorical_cols):
+            if any(term in cat_col1.lower() for term in ['year', 'month', 'week', 'day', 'period', 'quarter', 'date']):
+                continue
+            for cat_col2 in categorical_cols[i+1:]:
+                if any(term in cat_col2.lower() for term in ['year', 'month', 'week', 'day', 'period', 'quarter', 'date']):
+                    continue
+                try:
+                    # Basic analysis
+                    pivot_table = create_pivot_table(df, metric, [cat_col1, cat_col2], agg_funcs)
+                    if is_meaningful_pivot_table(pivot_table):
+                        description = f"{metric} by {cat_col1} and {cat_col2}"
+                        suggestions.append((description, pivot_table))
+                    
+                    # Only create quartile analysis if:
+                    # 1. Both categorical columns have few enough unique values
+                    # 2. The metric is continuous
+                    # 3. We have enough data points per combination
+                    if (df[cat_col1].nunique() <= 10 and  # Not too many categories
+                        df[cat_col2].nunique() <= 10 and
+                        pd.api.types.is_float_dtype(df[metric]) and
+                        df.groupby([cat_col1, cat_col2])[metric].count().min() >= 5):
+                        
+                        pivot_table = create_pivot_table(df, metric, [cat_col1, cat_col2], agg_funcs_with_quartiles)
+                        if is_meaningful_pivot_table(pivot_table):
+                            description = f"Detailed {metric} Analysis by {cat_col1} and {cat_col2} (with quartiles)"
+                            suggestions.append((description, pivot_table))
+                except Exception as e:
+                    st.warning(f"Could not create pivot table for {metric} by {cat_col1} and {cat_col2}: {str(e)}")
+                    continue
     
     return suggestions
 
@@ -288,25 +329,31 @@ def rank_pivot_tables(suggestions: List[Tuple[str, pd.DataFrame]], df: pd.DataFr
     6. Opportunities for improvement
 
     For each selected table, provide a brief explanation of why it's valuable (max 2 sentences).
-    Format your response as:
-    indices: 0,1,2,3,4,5
-    explanations:
-    0. [explanation for first table]
-    1. [explanation for second table]
-    etc.
+    IMPORTANT: Use the actual pivot table numbers (0 to {len(suggestions)-1}) as indices, not sequential numbers.
+    
+    Return your response as a JSON array with exactly 6 objects, each containing:
+    - "index": the actual pivot table number (0 to {len(suggestions)-1})
+    - "explanation": a brief explanation of why this pivot table is valuable
+    
+    Example format:
+    [
+        {{"index": 0, "explanation": "This pivot table shows..."}},
+        {{"index": 1, "explanation": "This analysis reveals..."}},
+        ...
+    ]
     
     Pivot Tables:
     {chr(10).join(f"{i}. {desc}" for i, (desc, _) in enumerate(suggestions))}"""
     
     try:
-        # Set the API key
-        openai.api_key = api_key
+        # Create OpenAI client
+        client = OpenAI(api_key=api_key)
         
-        # Get ranking from OpenAI using the older API format
-        response = openai.ChatCompletion.create(
+        # Get ranking from OpenAI using the new API format
+        response = client.chat.completions.create(
             model="o3-mini",
             messages=[
-                {"role": "system", "content": "You are a business intelligence expert specializing in data analysis and strategic insights. Your task is to identify the most valuable pivot tables that drive business decisions."},
+                {"role": "system", "content": "You are a business intelligence expert specializing in data analysis and strategic insights. Your task is to identify the most valuable pivot tables that drive business decisions. Always use the actual pivot table numbers as indices, not sequential numbers. Return your response in JSON format."},
                 {"role": "user", "content": prompt}
             ]
         )
@@ -315,23 +362,42 @@ def rank_pivot_tables(suggestions: List[Tuple[str, pd.DataFrame]], df: pd.DataFr
         raw_response = response.choices[0].message.content
         
         # Parse the response
-        content = raw_response
-        indices_line = content.split('\n')[0]
-        explanations = content.split('explanations:')[1].strip().split('\n')
-        
-        # Get indices
-        indices = [int(idx.strip()) for idx in indices_line.split('indices:')[1].strip().split(',')]
-        
-        # Create explanations dictionary
-        explanations_dict = {}
-        for exp in explanations:
-            if exp.strip():
-                idx, text = exp.split('.', 1)
-                explanations_dict[int(idx.strip())] = text.strip()
-        
-        # Return the top 6 pivot tables with explanations, raw response, and prompt
-        return [(suggestions[i][0], suggestions[i][1], explanations_dict.get(i, "No explanation provided")) 
-                for i in indices if i < len(suggestions)], raw_response, prompt
+        try:
+            # Extract JSON from the response
+            import json
+            # Find the first '[' and last ']' to extract the JSON array
+            json_start = raw_response.find('[')
+            json_end = raw_response.rfind(']') + 1
+            if json_start == -1 or json_end == 0:
+                raise ValueError("No JSON array found in response")
+            
+            json_str = raw_response[json_start:json_end]
+            rankings = json.loads(json_str)
+            
+            # Validate the response
+            if not isinstance(rankings, list):
+                raise ValueError("Response is not a JSON array")
+            if len(rankings) != 6:
+                raise ValueError(f"Expected 6 rankings, got {len(rankings)}")
+            
+            # Extract indices and explanations
+            indices = [item["index"] for item in rankings]
+            explanations = {item["index"]: item["explanation"] for item in rankings}
+            
+            # Validate indices
+            if not all(0 <= idx < len(suggestions) for idx in indices):
+                raise ValueError("Invalid index found in response")
+            
+            # Return the top 6 pivot tables with explanations
+            return [(suggestions[i][0], suggestions[i][1], explanations[i]) 
+                    for i in indices], raw_response, prompt
+            
+        except Exception as e:
+            st.warning(f"Error parsing OpenAI response: {str(e)}")
+            # If parsing fails, return the first 6 suggestions with default explanations
+            return [(desc, table, "Selected as one of the top pivot tables") 
+                    for desc, table in suggestions[:6]], raw_response, prompt
+            
     except Exception as e:
         st.warning(f"Could not rank pivot tables using OpenAI: {str(e)}")
         # If OpenAI fails, return the first 6 suggestions with default explanations
@@ -398,7 +464,10 @@ def create_visualization(pivot_table: pd.DataFrame, description: str) -> None:
         st.warning(f"Could not create visualization: {str(e)}")
 
 def main():
+    # Set page config must be the first Streamlit command
     st.set_page_config(page_title="CSV Pivot Table Analyzer", layout="wide")
+    
+    # Rest of the Streamlit commands
     st.title("CSV Pivot Table Analyzer")
     st.write("Upload your CSV file to get suggested pivot tables and insights.")
     
